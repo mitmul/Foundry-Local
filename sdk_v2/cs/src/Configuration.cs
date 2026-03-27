@@ -32,6 +32,13 @@ public class Configuration
     public string? LogsDir { get; init; }
 
     /// <summary>
+    /// Path to the native Foundry Local Core library.
+    /// When set, the SDK will prefer this explicit library location over the build output directory.
+    /// The sibling directory is also used for onnxruntime and onnxruntime-genai native dependencies.
+    /// </summary>
+    public string? LibraryPath { get; init; }
+
+    /// <summary>
     /// Logging level.
     /// Valid values are: Verbose, Debug, Information, Warning, Error, Fatal.
     /// Default: LogLevel.Warning
@@ -120,6 +127,11 @@ public class Configuration
         if (!string.IsNullOrEmpty(LogsDir))
         {
             configValues.Add("LogsDir", LogsDir);
+        }
+
+        if (!string.IsNullOrEmpty(LibraryPath))
+        {
+            configValues.Add("FoundryLocalCorePath", LibraryPath);
         }
 
         if (Web != null)

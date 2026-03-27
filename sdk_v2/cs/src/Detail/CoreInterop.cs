@@ -17,7 +17,10 @@ internal partial class CoreInterop : ICoreInterop
 {
     // TODO: Android and iOS may need special handling. See ORT C# NativeMethods.shared.cs
     internal const string LibraryName = "Microsoft.AI.Foundry.Local.Core";
+    private const uint LoadLibrarySearchDefaultDirs = 0x00001000;
+    private const uint LoadLibrarySearchUserDirs = 0x00000400;
     private readonly ILogger _logger;
+    private static readonly object explicitLibraryPathLock = new();
 
     private static string AddLibraryExtension(string name) =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? $"{name}.dll" :
@@ -27,6 +30,84 @@ internal partial class CoreInterop : ICoreInterop
 
     private static IntPtr genaiLibHandle = IntPtr.Zero;
     private static IntPtr ortLibHandle = IntPtr.Zero;
+    private static string? explicitLibraryPath;
+    private static string? explicitLibraryDirectory;
+
+    [LibraryImport("kernel32", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetDefaultDllDirectories(uint directoryFlags);
+
+    [LibraryImport("kernel32", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial nint AddDllDirectory(string newDirectory);
+
+    internal static void ConfigureExplicitLibraryPath(string? libraryPath)
+    {
+        lock (explicitLibraryPathLock)
+        {
+            explicitLibraryPath = NormalizeExplicitLibraryPath(libraryPath);
+            explicitLibraryDirectory = explicitLibraryPath == null
+                ? null
+                : Path.GetDirectoryName(explicitLibraryPath);
+        }
+    }
+
+    private static string? NormalizeExplicitLibraryPath(string? libraryPath)
+    {
+        if (string.IsNullOrWhiteSpace(libraryPath))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(libraryPath);
+    }
+
+    private static (string? LibraryPath, string? DirectoryPath) GetExplicitLibraryLocation()
+    {
+        lock (explicitLibraryPathLock)
+        {
+            if (!string.IsNullOrWhiteSpace(explicitLibraryPath))
+            {
+                return (explicitLibraryPath, explicitLibraryDirectory);
+            }
+        }
+
+        var envLibraryPath = NormalizeExplicitLibraryPath(Environment.GetEnvironmentVariable("FOUNDRY_LOCAL_CORE_PATH"));
+        if (!string.IsNullOrWhiteSpace(envLibraryPath))
+        {
+            return (envLibraryPath, Path.GetDirectoryName(envLibraryPath));
+        }
+
+        var envLibraryDir = Environment.GetEnvironmentVariable("FOUNDRY_LOCAL_CORE_DIR");
+        if (!string.IsNullOrWhiteSpace(envLibraryDir))
+        {
+            var fullDirectory = Path.GetFullPath(envLibraryDir);
+            return (Path.Combine(fullDirectory, AddLibraryExtension(LibraryName)), fullDirectory);
+        }
+
+        return (null, null);
+    }
+
+    private static void ConfigureWindowsDllSearchDirectory(string path)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        _ = SetDefaultDllDirectories(LoadLibrarySearchDefaultDirs | LoadLibrarySearchUserDirs);
+        _ = AddDllDirectory(path);
+
+        var currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var pathEntries = currentPath.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var alreadyPresent = pathEntries.Any(entry =>
+            string.Equals(Path.GetFullPath(entry), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase));
+        if (!alreadyPresent)
+        {
+            Environment.SetEnvironmentVariable("PATH", string.IsNullOrEmpty(currentPath)
+                ? path
+                : $"{path};{currentPath}");
+        }
+    }
 
     // we need to manually load ORT and ORT GenAI dlls on Windows to ensure
     // a) we're using the libraries we think we are
@@ -51,6 +132,17 @@ internal partial class CoreInterop : ICoreInterop
 #endif
     }
 
+    private static IntPtr TryLoadCoreLibrary(string libraryPath, string siblingDirectory)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            ConfigureWindowsDllSearchDirectory(siblingDirectory);
+            LoadOrtDllsIfInSameDir(siblingDirectory);
+        }
+
+        return NativeLibrary.TryLoad(libraryPath, out var handle) ? handle : IntPtr.Zero;
+    }
+
     static CoreInterop()
     {
         NativeLibrary.SetDllImportResolver(typeof(CoreInterop).Assembly, (libraryName, assembly, searchPath) =>
@@ -60,7 +152,20 @@ internal partial class CoreInterop : ICoreInterop
 #if DEBUG
                 Console.WriteLine($"Resolving {libraryName}. BaseDirectory: {AppContext.BaseDirectory}");
 #endif
-                var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+                var (configuredLibraryPath, configuredDirectory) = GetExplicitLibraryLocation();
+                if (!string.IsNullOrWhiteSpace(configuredLibraryPath) &&
+                    !string.IsNullOrWhiteSpace(configuredDirectory) &&
+                    File.Exists(configuredLibraryPath))
+                {
+                    var handle = TryLoadCoreLibrary(configuredLibraryPath, configuredDirectory);
+                    if (handle != IntPtr.Zero)
+                    {
+#if DEBUG
+                        Console.WriteLine($"Loaded native library from explicit path: {configuredLibraryPath}");
+#endif
+                        return handle;
+                    }
+                }
 
                 // check if this build is platform specific. in that case all files are flattened in the one directory
                 // and there's no need to look in runtimes/<os>-<arch>/native.
@@ -68,16 +173,12 @@ internal partial class CoreInterop : ICoreInterop
                 var libraryPath = Path.Combine(AppContext.BaseDirectory, AddLibraryExtension(LibraryName));
                 if (File.Exists(libraryPath))
                 {
-                    if (NativeLibrary.TryLoad(libraryPath, out var handle))
+                    var handle = TryLoadCoreLibrary(libraryPath, AppContext.BaseDirectory);
+                    if (handle != IntPtr.Zero)
                     {
 #if DEBUG
                         Console.WriteLine($"Loaded native library from: {libraryPath}");
 #endif
-                        if (isWindows)
-                        {
-                            LoadOrtDllsIfInSameDir(AppContext.BaseDirectory);
-                        }
-
                         return handle;
                     }
                 }
@@ -99,16 +200,12 @@ internal partial class CoreInterop : ICoreInterop
 #endif
                 if (File.Exists(libraryPath))
                 {
-                    if (NativeLibrary.TryLoad(libraryPath, out var handle))
+                    var handle = TryLoadCoreLibrary(libraryPath, runtimePath);
+                    if (handle != IntPtr.Zero)
                     {
 #if DEBUG
                         Console.WriteLine($"Loaded native library from: {libraryPath}");
 #endif
-                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                        {
-                            LoadOrtDllsIfInSameDir(runtimePath);
-                        }
-
                         return handle;
                     }
                 }
@@ -122,6 +219,7 @@ internal partial class CoreInterop : ICoreInterop
     {
 
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ConfigureExplicitLibraryPath(config.LibraryPath);
 
         var request = new CoreInteropRequest { Params = config.AsDictionary() };
         var response = ExecuteCommand("initialize", request);
